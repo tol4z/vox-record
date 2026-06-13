@@ -1,0 +1,189 @@
+import os
+import wave
+import time
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import pyaudio
+import numpy as np
+
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+RATE = 44100
+CHUNK = 1024
+
+class AudioRecorderGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Rejestrator VOX Pro")
+        self.root.geometry("420x420")
+        
+        self.is_monitoring = False
+        self.is_recording = False
+        self.save_directory = os.path.expanduser("~/Pulpit") # Domyślnie Pulpit
+        
+        # --- SEKCJA USTAWIEŃ ---
+        # Ścieżka zapisu
+        self.frame_dir = tk.LabelFrame(root, text="Lokalizacja zapisu", padx=10, pady=5)
+        self.frame_dir.pack(fill="x", padx=15, pady=5)
+        
+        self.lbl_dir = tk.Label(self.frame_dir, text=self.save_directory, fg="green", wraplength=380, justify="left")
+        self.lbl_dir.pack(side="left", fill="x", expand=True)
+        
+        self.btn_browse = tk.Button(self.frame_dir, text="Zmień...", command=self.choose_directory)
+        self.btn_browse.pack(side="right")
+        
+        # Parametry nagrywania
+        self.frame_params = tk.LabelFrame(root, text="Parametry VOX", padx=10, pady=5)
+        self.frame_params.pack(fill="x", padx=15, pady=5)
+        
+        tk.Label(self.frame_params, text="Próg głośności (Threshold):").grid(row=0, column=0, sticky="w", pady=5)
+        self.entry_threshold = tk.Entry(self.frame_params, width=10)
+        self.entry_threshold.insert(0, "10000")
+        self.entry_threshold.grid(row=0, column=1, sticky="w", padx=5)
+        
+        tk.Label(self.frame_params, text="Limit ciszy po (sekundy):").grid(row=1, column=0, sticky="w", pady=5)
+        self.entry_silence = tk.Entry(self.frame_params, width=10)
+        self.entry_silence.insert(0, "0.5")
+        self.entry_silence.grid(row=1, column=1, sticky="w", padx=5)
+
+        tk.Label(self.frame_params, text="Bufor wsteczny przed (sekundy):").grid(row=2, column=0, sticky="w", pady=5)
+        self.entry_prebuf = tk.Entry(self.frame_params, width=10)
+        self.entry_prebuf.insert(0, "0.5")
+        self.entry_prebuf.grid(row=2, column=1, sticky="w", padx=5)
+        
+        # --- PODGLĄD GŁOŚNOŚCI NA ŻYWO ---
+        self.lbl_volume = tk.Label(root, text="Aktualny poziom dźwięku: 0", font=("Arial", 10))
+        self.lbl_volume.pack(pady=5)
+        
+        # --- STATUS I PRZYCISKI ---
+        self.label_status = tk.Label(root, text="Status: Wyłączony", font=("Arial", 12, "bold"))
+        self.label_status.pack(pady=10)
+        
+        self.btn_start = tk.Button(root, text="URUCHOM", command=self.start_monitoring, bg="green", fg="white", width=15, height=2)
+        self.btn_start.pack(pady=5)
+        
+        self.btn_stop = tk.Button(root, text="ZATRZYMAJ", command=self.stop_monitoring, bg="red", fg="white", width=15, height=2, state=tk.DISABLED)
+        self.btn_stop.pack(pady=5)
+        
+        self.p = pyaudio.PyAudio()
+
+    def choose_directory(self):
+        dir_path = filedialog.askdirectory(initialdir=self.save_directory, title="Wybierz folder zapisu")
+        if dir_path:
+            self.save_directory = dir_path
+            self.lbl_dir.config(text=self.save_directory)
+
+    def start_monitoring(self):
+        try:
+            # Pobieramy wartości z okienka
+            self.current_threshold = int(self.entry_threshold.get())
+            self.current_silence_limit = float(self.entry_silence.get())
+            self.current_prebuf_time = float(self.entry_prebuf.get())
+        except ValueError:
+            messagebox.showerror("Błąd", "Wprowadź poprawne liczby w ustawieniach VOX! Używaj kropki jako separatora.")
+            return
+
+        self.is_monitoring = True
+        self.btn_start.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        self.entry_threshold.config(state=tk.DISABLED)
+        self.entry_silence.config(state=tk.DISABLED)
+        self.entry_prebuf.config(state=tk.DISABLED)
+        self.btn_browse.config(state=tk.DISABLED)
+        self.label_status.config(text="Status: Czuwanie (Słucham...)", fg="blue")
+        
+        self.thread = threading.Thread(target=self.audio_loop)
+        self.thread.start()
+
+    def stop_monitoring(self):
+        self.is_monitoring = False
+        self.btn_start.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+        self.entry_threshold.config(state=tk.NORMAL)
+        self.entry_silence.config(state=tk.NORMAL)
+        self.entry_prebuf.config(state=tk.NORMAL)
+        self.btn_browse.config(state=tk.NORMAL)
+        self.label_status.config(text="Status: Wyłączony", fg="black")
+        self.lbl_volume.config(text="Aktualny poziom dźwięku: 0")
+
+    def audio_loop(self):
+        try:
+            stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+        except Exception as e:
+            messagebox.showerror("Błąd audio", f"Nie można otworzyć mikrofonu. Sprawdź ustawienia systemu.\nSzczegóły: {e}")
+            self.root.after(0, self.stop_monitoring)
+            return
+        
+        # Dynamiczne obliczanie wielkości bufora na podstawie wpisanej wartości
+        max_pre_chunks = int(RATE / CHUNK * self.current_prebuf_time)
+        if max_pre_chunks < 1:
+            max_pre_chunks = 1
+            
+        pre_buffer = []
+        recorded_frames = []
+        silent_chunks = 0
+        limit_silent_chunks = int(RATE / CHUNK * self.current_silence_limit)
+
+        while self.is_monitoring:
+            try:
+                data = stream.read(CHUNK, exception_on_overflow=False)
+            except Exception:
+                continue
+            
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            amplitude = np.max(np.abs(audio_data))
+            
+            # Aktualizacja poziomu głośności na żywo
+            self.lbl_volume.config(text=f"Aktualny poziom dźwięku: {amplitude}")
+            
+            if not self.is_recording:
+                pre_buffer.append(data)
+                if len(pre_buffer) > max_pre_chunks:
+                    pre_buffer.pop(0)
+                
+                if amplitude > self.current_threshold:
+                    self.is_recording = True
+                    self.label_status.config(text="STATUS: NAGRYWAM!", fg="red")
+                    recorded_frames = list(pre_buffer)
+                    recorded_frames.append(data)
+                    silent_chunks = 0
+            else:
+                recorded_frames.append(data)
+                if amplitude < self.current_threshold:
+                    silent_chunks += 1
+                else:
+                    silent_chunks = 0
+                
+                if silent_chunks > limit_silent_chunks:
+                    self.is_recording = False
+                    self.label_status.config(text="Status: Czuwanie (Słucham...)", fg="blue")
+                    self.save_file(recorded_frames)
+                    recorded_frames = []
+                    pre_buffer = []
+
+        stream.stop_stream()
+        stream.close()
+
+    def save_file(self, frames):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"nagranie_{timestamp}.wav"
+        full_path = os.path.join(self.save_directory, filename)
+        
+        try:
+            wf = wave.open(full_path, 'wb')
+            wf.setnchannels(CHANNELS)
+            wf.setsampwidth(self.p.get_sample_size(FORMAT))
+            wf.setframerate(RATE)
+            wf.writeframes(b''.join(frames))
+            wf.close()
+        except Exception as e:
+            print(f"Błąd zapisu pliku: {e}")
+
+    def __del__(self):
+        self.p.terminate()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AudioRecorderGUI(root)
+    root.mainloop()
